@@ -29,6 +29,8 @@ iterations.  `hamerly=True` uses them to skip points entirely.
 All variants (plain Lloyd, Hamerly, TN, TN+Hamerly) share this code path and
 the same BLAS, so timings differ only by the pruning strategy.
 """
+import ctypes
+import os
 import time
 import numpy as np
 from scipy import sparse
@@ -55,9 +57,24 @@ def _group_sums(X, rows, labels, k):
     return H @ (X if rows is None else X[rows])
 
 
+def _load_kernel():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'libtnk.so')
+    if not os.path.exists(path):
+        return None
+    lib = ctypes.CDLL(path)
+    lib.tn_assign.restype = None
+    return lib
+
+
+_LIB = _load_kernel()
+_P = ctypes.c_void_p
+
+
 class TNKMeans:
-    def __init__(self, levels=(8, 24, 64), hamerly=True, max_iter=300,
-                 sample=10000, seed=0, pair_frac=0.25, chunk_elems=1 << 22):
+    def __init__(self, levels=(16, 48, 128), hamerly=True, max_iter=300,
+                 sample=4000, seed=0, pair_frac=0.25, chunk_elems=1 << 22,
+                 kernel='c'):
+        self.kernel = kernel if _LIB is not None else 'numpy'
         self.levels = tuple(levels)
         self.hamerly = hamerly
         self.max_iter = max_iter
@@ -107,9 +124,10 @@ class TNKMeans:
             a = b
         self.ctail2 = np.maximum(cc2[None, :] - np.cumsum(self.cblk, axis=0), 0.0)
         self.ctail = np.sqrt(self.ctail2)
+        self.CZ = np.ascontiguousarray(self.CZ)
 
     # ------------------------------------------------------------- assignment
-    def _assign(self, X, rows):
+    def _assign(self, X, rows, prev=None, init=None):
         """Exact nearest centre for `rows` (index array or None for all).
 
         Returns labels, squared upper bound on the distance to the assigned
@@ -120,6 +138,23 @@ class TNKMeans:
         lab = np.empty(n, dtype=np.int64)
         ub2 = np.empty(n)
         lb2 = np.empty(n)
+        if self.kernel == 'c' and self.levels:
+            L = len(self.lv)
+            lev = np.array(self.lv, dtype=np.int64)
+            stat = np.zeros(2 + L, dtype=np.int64)
+            C = np.ascontiguousarray(self.C)
+            CZT = np.ascontiguousarray(self.CZ[:, :self.lv[0]].T)
+            rp = None if rows is None else np.ascontiguousarray(rows, dtype=np.int64)
+            a = lambda v: None if v is None else _P(v.ctypes.data)
+            L_ = ctypes.c_long
+            _LIB.tn_assign(a(X), a(self.Z), a(self.xtail), a(self.xn), a(C), a(self.CZ), a(CZT),
+                           a(self.ctail), a(self.cn), a(rp), L_(n), L_(X.shape[1]),
+                           L_(self.Z.shape[1]), L_(k), L_(L), a(lev), a(prev), a(init),
+                           a(lab), a(ub2), a(lb2), a(stat))
+            self.stats['lowdim'] += int(stat[0])
+            self.stats['pairs'] += int(stat[1])
+            self.stats['decided'][:L] += stat[2:]
+            return lab, ub2, lb2
         step = max(256, self.chunk_elems // k)
         for s in range(0, n, step):
             e = min(n, s + step)
@@ -127,6 +162,24 @@ class TNKMeans:
             sl = slice(s, e) if rows is None else None
             self._assign_chunk(X, cur, sl, lab[s:e], ub2[s:e], lb2[s:e])
         return lab, ub2, lb2
+
+    def _sketch_ub2(self, rows, lab):
+        """Squared upper bound on ||x - c_lab|| from the M-coordinate sketch."""
+        n = len(lab)
+        out = np.empty(n)
+        if self.kernel == 'c':
+            a = lambda v: None if v is None else _P(v.ctypes.data)
+            L_ = ctypes.c_long
+            lab = np.ascontiguousarray(lab, dtype=np.int64)
+            rp = None if rows is None else np.ascontiguousarray(rows, dtype=np.int64)
+            _LIB.tn_ub(a(self.Z), a(self.xtail), a(self.CZ), a(self.ctail), a(rp), L_(n),
+                       L_(self.Z.shape[1]), L_(len(self.C)), L_(len(self.lv)), a(lab), a(out))
+            return out
+        Dz = (self.Z if rows is None else self.Z[rows]) - self.CZ[lab]
+        out = np.einsum('ij,ij->i', Dz, Dz)
+        xt = self.xtail[:, -1] if rows is None else self.xtail[rows, -1]
+        out += (xt + self.ctail[-1][lab]) ** 2
+        return out
 
     def _assign_chunk(self, X, cur, sl, lab, ub2, lb2):
         k = len(self.C)
@@ -243,12 +296,11 @@ class TNKMeans:
                 sc = 0.5 * np.sqrt(np.maximum(CC.min(axis=1), 0.0))
                 thr = np.maximum(lb, sc[labels])
                 cand = np.nonzero(ub > thr)[0]
+                prev = init = None
                 if len(cand):                        # tighten the upper bound
                     la = labels[cand]
                     if self.levels:
-                        Dz = self.Z[cand] - self.CZ[la]
-                        t = np.einsum('ij,ij->i', Dz, Dz)
-                        t += (self.xtail[cand, -1] + self.ctail[-1][la]) ** 2
+                        t = self._sketch_ub2(cand, la)
                     else:
                         t = np.empty(len(cand))
                         for s in range(0, len(cand), 8192):
@@ -257,15 +309,21 @@ class TNKMeans:
                         t *= -2.0
                         t += self.xn[cand] + self.cn[la]
                     ub[cand] = np.sqrt(np.maximum(t, 0.0))
-                    cand = cand[ub[cand] > thr[cand]]
+                    keep = ub[cand] > thr[cand]
+                    cand = cand[keep]
+                    if self.levels and self.kernel == 'c':
+                        prev, init = np.ascontiguousarray(la[keep]), np.ascontiguousarray(t[keep])
                 rows = cand
             else:
                 rows = np.arange(n)
+                prev = init = None
+                if self.levels and self.kernel == 'c':
+                    prev, init = labels, self._sketch_ub2(None, labels)
             self.stats['visited'] += len(rows)
             self.stats['skipped'] += n - len(rows)
             if len(rows) == 0:
                 break
-            nl, u2, l2 = self._assign(X, None if len(rows) == n else rows)
+            nl, u2, l2 = self._assign(X, None if len(rows) == n else rows, prev, init)
             if self.hamerly:
                 ub[rows] = np.sqrt(np.maximum(u2, 0.0))
                 lb[rows] = np.sqrt(np.maximum(l2, 0.0))
@@ -286,6 +344,9 @@ class TNKMeans:
         self.labels = labels
         self.centers = self.C
         self.time = time.perf_counter() - t0
-        Dv = X - self.C[labels]
-        self.inertia = float(np.einsum('ij,ij->', Dv, Dv))
+        # sum_i ||x_i - c_{a(i)}||^2 from the per-cluster sums (no n x d temporary)
+        sums = _group_sums(X, None, labels, k)
+        counts = np.bincount(labels, minlength=k)
+        self.inertia = float(self.xn.sum() - 2.0 * np.einsum('ij,ij->', sums, self.C)
+                             + counts @ self.cn)
         return self

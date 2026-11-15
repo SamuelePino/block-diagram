@@ -27,20 +27,23 @@ def load(name, ddir):
     raise ValueError(name)
 
 
+KS = (50, 200, 1000)
+
+
 def main():
     ddir = sys.argv[1]
     names = sys.argv[2:] or ['mnist', 'fashion', 'gmm', 'flat']
-    print('dataset      k  method        time(s)  speedup  iters  inertia_rel  agree   visited  pairs/(n*k*it)')
+    print('dataset      k  method        time(s)  speedup  iters  inertia_rel  agree   visited  exact_pair_frac  sketch_coords/pair')
     for name in names:
         X = load(name, ddir)
         n, d = X.shape
-        for k in (50, 200, 1000):
+        for k in KS:
             C0, _ = kmeans_plusplus(X[:20000], k, random_state=0)
             variants = [
                 ('lloyd', dict(levels=(), hamerly=False)),
                 ('hamerly', dict(levels=(), hamerly=True)),
-                ('tn', dict(levels=(8, 24, 64), hamerly=False)),
-                ('tn+hamerly', dict(levels=(8, 24, 64), hamerly=True)),
+                ('tn', dict(hamerly=False)),
+                ('tn+hamerly', dict(hamerly=True)),
             ]
             ref = None
             for vn, kw in variants:
@@ -50,7 +53,7 @@ def main():
                 st = m.stats
                 print(f'{name:8s} {k:5d}  {vn:12s} {m.time:8.2f} {ref.time / m.time:7.2f}x {m.n_iter:6d} '
                       f'{m.inertia / ref.inertia - 1:+.1e}  {np.mean(m.labels == ref.labels):.4f} '
-                      f'{st["visited"] / (n * (m.n_iter + 1)):8.3f} {st["pairs"] / (n * k * (m.n_iter + 1)):8.4f}',
+                      f'{st["visited"] / (n * (m.n_iter + 1)):8.3f} {st["pairs"] / (n * k * (m.n_iter + 1)):8.4f} {st["lowdim"] / (n * k * (m.n_iter + 1)):6.1f}',
                       flush=True)
             for alg in ('lloyd', 'elkan'):
                 t = time.perf_counter()
